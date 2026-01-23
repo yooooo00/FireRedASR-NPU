@@ -21,6 +21,12 @@ parser.add_argument("--output", type=str)
 
 # Decode Options
 parser.add_argument('--use_gpu', type=int, default=1)
+parser.add_argument(
+    "--device",
+    type=str,
+    default=None,
+    help="Device to run inference on (e.g. cpu, cuda:0, npu:0). If set, overrides --use_gpu.",
+)
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--beam_size", type=int, default=1)
 parser.add_argument("--decode_max_len", type=int, default=0)
@@ -42,6 +48,10 @@ def main(args):
 
     model = FireRedAsr.from_pretrained(args.asr_type, args.model_dir)
 
+    device = args.device
+    if device is None:
+        device = "cuda:0" if args.use_gpu else "cpu"
+
     batch_uttid = []
     batch_wav_path = []
     for i, wav in enumerate(wavs):
@@ -56,6 +66,7 @@ def main(args):
             batch_wav_path,
             {
             "use_gpu": args.use_gpu,
+            "device": device,
             "beam_size": args.beam_size,
             "nbest": args.nbest,
             "decode_max_len": args.decode_max_len,

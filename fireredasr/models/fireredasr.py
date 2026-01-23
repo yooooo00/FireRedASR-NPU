@@ -41,13 +41,20 @@ class FireRedAsr:
 
     @torch.no_grad()
     def transcribe(self, batch_uttid, batch_wav_path, args={}):
+        device = args.get("device", None)
+        if device is None:
+            device = "cuda:0" if args.get("use_gpu", False) else "cpu"
+        device = torch.device(device)
+        if device.type == "npu":
+            try:
+                import torch_npu  # noqa: F401
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("Requested NPU device but torch_npu is not available") from e
+
         feats, lengths, durs = self.feat_extractor(batch_wav_path)
         total_dur = sum(durs)
-        if args.get("use_gpu", False):
-            feats, lengths = feats.cuda(), lengths.cuda()
-            self.model.cuda()
-        else:
-            self.model.cpu()
+        feats, lengths = feats.to(device), lengths.to(device)
+        self.model.to(device)
 
         if self.asr_type == "aed":
             start_time = time.time()
@@ -79,9 +86,8 @@ class FireRedAsr:
                 LlmTokenizerWrapper.preprocess_texts(
                     origin_texts=[""]*feats.size(0), tokenizer=self.tokenizer,
                     max_len=128, decode=True)
-            if args.get("use_gpu", False):
-                input_ids = input_ids.cuda()
-                attention_mask = attention_mask.cuda()
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
             start_time = time.time()
 
             generated_ids = self.model.transcribe(
