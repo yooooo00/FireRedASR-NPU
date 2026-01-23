@@ -77,10 +77,10 @@ def parse_args():
         "--compile_impl",
         type=str,
         default="auto",
-        choices=["auto", "decoder_method", "run_kernel", "batch_beam_search"],
+        choices=["auto", "decoder_method", "run_kernel", "batch_beam_search", "script"],
         help=(
             "auto: prefer decoder.compile_kernel() / run_kernel compilation if available; "
-            "otherwise compile batch_beam_search."
+            "otherwise compile batch_beam_search. (script is an alias of run_kernel)"
         ),
     )
     parser.add_argument("--dynamic", action="store_true", help="torch.compile(dynamic=True)")
@@ -306,10 +306,13 @@ def main():
     compile_time_s = None
     compile_error = None
     compile_path = None
+    compiled_targets = []
 
     if args.compile:
         backend = _get_npu_backend(args) if device.type == "npu" else None
         compile_choice = args.compile_impl
+        if compile_choice == "script":
+            compile_choice = "run_kernel"
         if compile_choice == "auto":
             if hasattr(decoder, "compile_kernel"):
                 compile_choice = "decoder_method"
@@ -325,18 +328,41 @@ def main():
             if compile_choice == "decoder_method":
                 decoder.compile_kernel()
                 compile_path = "decoder.compile_kernel()"
+                compiled_targets.append("decoder.compile_kernel()")
             elif compile_choice == "run_kernel":
-                if backend is None:
-                    raise RuntimeError("torchair is required for NPU compilation")
-                if hasattr(decoder, "_run_kernel_v1"):
-                    decoder.run_kernel_v1 = torch.compile(
-                        decoder._run_kernel_v1, dynamic=args.dynamic, fullgraph=args.fullgraph, backend=backend
+                compiled_any = False
+                if hasattr(decoder, "_run_kernel_v1") or hasattr(decoder, "_run_kernel_v2"):
+                    if backend is None:
+                        raise RuntimeError("torchair is required for NPU compilation")
+                    if hasattr(decoder, "_run_kernel_v1"):
+                        decoder.run_kernel_v1 = torch.compile(
+                            decoder._run_kernel_v1,
+                            dynamic=args.dynamic,
+                            fullgraph=args.fullgraph,
+                            backend=backend,
+                        )
+                        compiled_targets.append("decoder._run_kernel_v1")
+                        compiled_any = True
+                    if hasattr(decoder, "_run_kernel_v2"):
+                        decoder.run_kernel_v2 = torch.compile(
+                            decoder._run_kernel_v2,
+                            dynamic=args.dynamic,
+                            fullgraph=args.fullgraph,
+                            backend=backend,
+                        )
+                        compiled_targets.append("decoder._run_kernel_v2")
+                        compiled_any = True
+
+                if not compiled_any:
+                    print(
+                        "[compile] WARNING: decoder has no _run_kernel_v1/_run_kernel_v2; "
+                        "falling back to compiling the full decode path (batch_beam_search wrapper)."
                     )
-                if hasattr(decoder, "_run_kernel_v2"):
-                    decoder.run_kernel_v2 = torch.compile(
-                        decoder._run_kernel_v2, dynamic=args.dynamic, fullgraph=args.fullgraph, backend=backend
-                    )
-                compile_path = "decoder._run_kernel_v1/_run_kernel_v2"
+                    compile_choice = "batch_beam_search"
+                else:
+                    compile_path = "decoder._run_kernel_v1/_run_kernel_v2"
+                    if len(compiled_targets) == 1:
+                        compile_path = compiled_targets[0]
             else:
                 if backend is not None:
                     compiled_fn = torch.compile(
@@ -349,13 +375,30 @@ def main():
                     return compiled_fn()
 
                 compile_path = "run_decode()"
+                compiled_targets.append("run_decode()")
 
+                run_decode = run_decode_compiled
+
+            if compile_choice == "batch_beam_search":
+                if backend is not None:
+                    compiled_fn = torch.compile(
+                        run_decode, dynamic=args.dynamic, fullgraph=args.fullgraph, backend=backend
+                    )
+                else:
+                    compiled_fn = torch.compile(run_decode, dynamic=args.dynamic, fullgraph=args.fullgraph)
+
+                def run_decode_compiled():
+                    return compiled_fn()
+
+                compile_path = "run_decode()"
+                compiled_targets.append("run_decode()")
                 run_decode = run_decode_compiled
 
             run_decode()
             _synchronize(device)
             compile_time_s = time.time() - start
             print(f"[compile] first-run (compile+execute) time: {compile_time_s:.4f} s")
+            print(f"[compile] compiled targets: {compiled_targets}")
 
             compiled_stats = _bench("compiled", device, run_decode, args.warmup, args.iters)
         except Exception as e:  # pragma: no cover
@@ -376,6 +419,7 @@ def main():
         "dynamic": args.dynamic,
         "fullgraph": args.fullgraph,
         "compile_path": compile_path,
+        "compiled_targets": compiled_targets,
         "compile_time_s": compile_time_s,
         "compile_error": compile_error,
         "eager": eager_stats,
@@ -396,4 +440,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
