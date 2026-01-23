@@ -363,22 +363,6 @@ def main():
                     compile_path = "decoder._run_kernel_v1/_run_kernel_v2"
                     if len(compiled_targets) == 1:
                         compile_path = compiled_targets[0]
-            else:
-                if backend is not None:
-                    compiled_fn = torch.compile(
-                        run_decode, dynamic=args.dynamic, fullgraph=args.fullgraph, backend=backend
-                    )
-                else:
-                    compiled_fn = torch.compile(run_decode, dynamic=args.dynamic, fullgraph=args.fullgraph)
-
-                def run_decode_compiled():
-                    return compiled_fn()
-
-                compile_path = "run_decode()"
-                compiled_targets.append("run_decode()")
-
-                run_decode = run_decode_compiled
-
             if compile_choice == "batch_beam_search":
                 if backend is not None:
                     compiled_fn = torch.compile(
