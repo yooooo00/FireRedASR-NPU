@@ -22,9 +22,12 @@ decode_args="
 mkdir -p $(dirname $out)
 set -x
 
+# Override on non-CUDA devices, e.g.:
+#   FIREREDASR_DEVICE=npu:0 bash inference_fireredasr_llm.sh
+device_arg="--device ${FIREREDASR_DEVICE:-cuda:0}"
 
 CUDA_VISIBLE_DEVICES=0 \
-speech2text.py --asr_type "llm" --model_dir $model_dir $decode_args $wavs --output $out
+speech2text.py --asr_type "llm" --model_dir $model_dir $device_arg $decode_args $wavs --output $out
 
 
 ref="wav/text"
