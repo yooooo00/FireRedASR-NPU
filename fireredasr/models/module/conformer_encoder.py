@@ -2,6 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import torchair as tng
+    from torchair import CompilerConfig
+except ModuleNotFoundError:  # pragma: no cover
+    tng = None
+    CompilerConfig = None
+
 
 class ConformerEncoder(nn.Module):
     def __init__(self, idim, n_layers, n_head, d_model,
@@ -21,6 +28,29 @@ class ConformerEncoder(nn.Module):
                         dropout_rate, kernel_size)
             self.layer_stack.append(block)
 
+        self.run_layers = self._run_layers
+
+    def compile_kernel(self, backend=None, dynamic=True, fullgraph=False, mode="reduce-overhead"):
+        if backend is None and tng is not None and CompilerConfig is not None:
+            config = CompilerConfig()
+            config.experimental_config.frozen_parameter = True
+            if mode is not None:
+                config.mode = mode
+            backend = tng.get_npu_backend(compiler_config=config)
+
+        if backend is None:
+            self.run_layers = torch.compile(self._run_layers, dynamic=dynamic, fullgraph=fullgraph)
+        else:
+            self.run_layers = torch.compile(self._run_layers, dynamic=dynamic, fullgraph=fullgraph, backend=backend)
+
+    def reset_kernel(self):
+        self.run_layers = self._run_layers
+
+    def _run_layers(self, enc_output, pos_emb, src_mask):
+        for enc_layer in self.layer_stack:
+            enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask, pad_mask=src_mask)
+        return enc_output
+
     def forward(self, padded_input, input_lengths, pad=True):
         if pad:
             padded_input = F.pad(padded_input,
@@ -33,13 +63,7 @@ class ConformerEncoder(nn.Module):
         enc_output = self.dropout(embed_output)
 
         pos_emb = self.dropout(self.positional_encoding(embed_output))
-
-        enc_outputs = []
-        for enc_layer in self.layer_stack:
-            enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask,
-                                   pad_mask=src_mask)
-            enc_outputs.append(enc_output)
-
+        enc_output = self.run_layers(enc_output, pos_emb, src_mask)
         return enc_output, input_lengths, src_mask
 
     def padding_position_is_0(self, padded_input, input_lengths):

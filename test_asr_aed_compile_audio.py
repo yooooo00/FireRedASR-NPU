@@ -258,58 +258,40 @@ def main():
     model = model.to(dtype=dtype)
 
     # Optional compilation.
-    backend = _get_npu_backend(args) if device.type == "npu" else None
     compile_error = None
     compiled_targets = []
-
-    encoder_fn = model.encoder
-    decoder_fn = model.decoder
 
     if args.compile_target != "none":
         try:
             if args.compile_target in ("encoder", "end2end"):
-                if backend is not None:
-                    encoder_fn = torch.compile(
-                        model.encoder, dynamic=args.dynamic, fullgraph=args.fullgraph, backend=backend
-                    )
+                if hasattr(model.encoder, "compile_kernel"):
+                    compile_kwargs = {"dynamic": args.dynamic, "fullgraph": args.fullgraph}
+                    if args.compile_mode is not None:
+                        compile_kwargs["mode"] = args.compile_mode
+                    model.encoder.compile_kernel(**compile_kwargs)
+                    compiled_targets.append("encoder(run_layers)")
                 else:
-                    encoder_fn = torch.compile(model.encoder, dynamic=args.dynamic, fullgraph=args.fullgraph)
-                compiled_targets.append("encoder")
+                    compiled_targets.append("encoder(uncompiled)")
 
             if args.compile_target in ("decoder", "end2end"):
-
-                def _decoder_call(enc_outputs, enc_mask):
-                    return model.decoder.batch_beam_search(
-                        enc_outputs,
-                        enc_mask,
-                        args.beam_size,
-                        args.nbest,
-                        args.decode_max_len,
-                        args.softmax_smoothing,
-                        args.length_penalty,
-                        args.eos_penalty,
-                    )
-
-                if backend is not None:
-                    decoder_fn = torch.compile(
-                        _decoder_call, dynamic=args.dynamic, fullgraph=args.fullgraph, backend=backend
-                    )
+                if hasattr(model.decoder, "compile_kernel"):
+                    compile_kwargs = {"dynamic": args.dynamic, "fullgraph": args.fullgraph}
+                    if args.compile_mode is not None:
+                        compile_kwargs["mode"] = args.compile_mode
+                    model.decoder.compile_kernel(**compile_kwargs)
+                    compiled_targets.append("decoder(run_kernel)")
                 else:
-                    decoder_fn = torch.compile(_decoder_call, dynamic=args.dynamic, fullgraph=args.fullgraph)
-                compiled_targets.append("decoder(batch_beam_search)")
+                    compiled_targets.append("decoder(uncompiled)")
         except Exception as e:  # pragma: no cover
             compile_error = repr(e)
             print(f"[compile] failed during setup: {compile_error}")
 
     def run_encoder_only():
         with torch.no_grad():
-            return encoder_fn(feats, lengths)
+            return model.encoder(feats, lengths)
 
     def run_decoder_only(enc_outputs, enc_mask):
         with torch.no_grad():
-            # decoder_fn may be a module (not callable wrapper) if we didn't compile decoder.
-            if callable(decoder_fn) and not isinstance(decoder_fn, torch.nn.Module):
-                return decoder_fn(enc_outputs, enc_mask)
             return model.decoder.batch_beam_search(
                 enc_outputs,
                 enc_mask,
@@ -323,7 +305,7 @@ def main():
 
     def run_end2end():
         with torch.no_grad():
-            enc_outputs, _, enc_mask = encoder_fn(feats, lengths)
+            enc_outputs, _, enc_mask = model.encoder(feats, lengths)
             return run_decoder_only(enc_outputs, enc_mask)
 
     # Eager or compiled benchmark.
@@ -379,4 +361,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

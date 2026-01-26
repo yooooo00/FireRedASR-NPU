@@ -326,7 +326,12 @@ def main():
         try:
             start = time.time()
             if compile_choice == "decoder_method":
-                decoder.compile_kernel()
+                compile_kwargs = {"dynamic": args.dynamic, "fullgraph": args.fullgraph}
+                if backend is not None:
+                    compile_kwargs["backend"] = backend
+                if args.compile_mode is not None:
+                    compile_kwargs["mode"] = args.compile_mode
+                decoder.compile_kernel(**compile_kwargs)
                 compile_path = "decoder.compile_kernel()"
                 compiled_targets.append("decoder.compile_kernel()")
             elif compile_choice == "run_kernel":
