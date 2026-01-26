@@ -119,7 +119,7 @@ class TransformerDecoder(nn.Module):
         scores_temp = torch.tensor([0.0] + [-self.INF] * (B - 1), device=device).float()
         scores = scores_temp.repeat(N).view(N * B, 1)
         mask_score = scores_temp.view(1, B).repeat(N * B, 1)
-        is_finished = torch.zeros_like(scores)
+        is_finished = torch.zeros((N * B, 1), device=device, dtype=torch.bool)
 
         # Autoregressive Prediction
         for t in range(maxlen):
@@ -168,9 +168,7 @@ class TransformerDecoder(nn.Module):
             caches = [cache[topB_row_number_in_ys] for cache in caches]
 
             # Update finished state
-            is_finished = t_ys.eq(self.eos_id)
-            if is_finished.sum().item() == N*B:
-                break
+            is_finished = torch.logical_or(is_finished, t_ys.eq(self.eos_id))
 
         # Length penalty (follow GNMT)
         scores = scores.view(N, B)

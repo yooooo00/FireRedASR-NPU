@@ -68,6 +68,15 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
 
+    parser.add_argument(
+        "--cases",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional override cases, e.g. --cases 8,152 16,152 8,304 (default uses built-in table cases)",
+    )
+    parser.add_argument("--max_cases", type=int, default=None, help="Optional truncate case list (useful for quick smoke)")
+
     parser.add_argument("--compile", action="store_true", help="Run compiled-kernel benchmark (default on)")
     parser.add_argument("--no-compile", dest="compile", action="store_false")
     parser.set_defaults(compile=True)
@@ -79,6 +88,22 @@ def parse_args():
 
     parser.add_argument("--out_md", type=str, default="out/firered_aed_encoder_decoder_delay.md")
     return parser.parse_args()
+
+
+def _parse_cases(args) -> List[BenchCase]:
+    if not args.cases:
+        cases = list(DEFAULT_CASES)
+    else:
+        cases = []
+        for spec in args.cases:
+            parts = [p.strip() for p in spec.split(",")]
+            if len(parts) != 2:
+                raise ValueError(f"Invalid --cases item: {spec!r}, expected 'B,T'")
+            cases.append(BenchCase(int(parts[0]), int(parts[1])))
+
+    if args.max_cases is not None:
+        cases = cases[: int(args.max_cases)]
+    return cases
 
 
 def _dtype_from_arg(dtype: str) -> torch.dtype:
@@ -163,6 +188,7 @@ def main():
     args = parse_args()
     device = _device_from_arg(args.device)
     dtype = _dtype_from_arg(args.dtype)
+    cases = _parse_cases(args)
 
     if device.type == "npu":
         if torch_npu is None:
@@ -172,10 +198,27 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    model = load_fireredasr_aed_model(args.ckpt).to(device).eval()
-    model = model.to(dtype=dtype)
+    t0 = time.time()
+    model = load_fireredasr_aed_model(args.ckpt)
+    print(f"[load] model constructed in {(time.time() - t0):.3f}s", flush=True)
 
-    def run_case(case: BenchCase) -> Tuple[float, float]:
+    t1 = time.time()
+    print(f"[load] moving model to {device} ...", flush=True)
+    model = model.to(device).eval()
+    print(f"[load] moved to device in {(time.time() - t1):.3f}s", flush=True)
+
+    t2 = time.time()
+    print(f"[load] converting dtype to {dtype} ...", flush=True)
+    model = model.to(dtype=dtype)
+    print(f"[load] converted dtype in {(time.time() - t2):.3f}s", flush=True)
+
+    print(
+        f"bench: #cases={len(cases)} warmup={args.warmup} iters={args.iters} "
+        f"compile={args.compile} dynamic={args.dynamic} fullgraph={args.fullgraph} mode={args.compile_mode}"
+    )
+
+    def run_case(case: BenchCase, phase: str) -> Tuple[float, float]:
+        print(f"[{phase}] case: B={case.batch_size} T={case.length_t} ...", flush=True)
         pad_extra = int(model.encoder.input_preprocessor.context - 1)
         padded_len = _find_input_len_for_t(case.length_t)
         input_len = padded_len - pad_extra
@@ -207,15 +250,18 @@ def main():
                 )
 
         dec_ms = _bench_ms(device, dec_step, args.warmup, args.iters)
+        print(f"[{phase}] done: B={case.batch_size} T={case.length_t} enc={enc_ms:.3f}ms dec={dec_ms:.3f}ms", flush=True)
         return enc_ms, dec_ms
 
     eager_rows = []
-    for case in DEFAULT_CASES:
-        enc_ms, dec_ms = run_case(case)
+    print("\n[phase] eager", flush=True)
+    for case in cases:
+        enc_ms, dec_ms = run_case(case, "eager")
         eager_rows.append((case.batch_size, case.length_t, enc_ms, dec_ms))
 
     compiled_rows = []
     if args.compile:
+        print("\n[phase] compile-kernel setup", flush=True)
         if hasattr(model.encoder, "reset_kernel"):
             model.encoder.reset_kernel()
         if hasattr(model.decoder, "reset_kernel"):
@@ -225,8 +271,9 @@ def main():
         if hasattr(model.decoder, "compile_kernel"):
             model.decoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
 
-        for case in DEFAULT_CASES:
-            enc_ms, dec_ms = run_case(case)
+        print("\n[phase] compiled", flush=True)
+        for case in cases:
+            enc_ms, dec_ms = run_case(case, "compiled")
             compiled_rows.append((case.batch_size, case.length_t, enc_ms, dec_ms))
 
     out_path = REPO_ROOT / args.out_md
