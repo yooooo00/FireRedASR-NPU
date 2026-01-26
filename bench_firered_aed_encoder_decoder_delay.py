@@ -10,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -83,8 +83,20 @@ def parse_args():
     parser.add_argument("--compile_mode", type=str, default="reduce-overhead")
     parser.add_argument("--dynamic", action="store_true", help="torch.compile(dynamic=True)")
     parser.add_argument("--no-dynamic", dest="dynamic", action="store_false")
-    parser.set_defaults(dynamic=True)
+    # For this benchmark we mostly test fixed shapes, so default to static compilation.
+    parser.set_defaults(dynamic=False)
     parser.add_argument("--fullgraph", action="store_true", help="torch.compile(fullgraph=True)")
+
+    parser.add_argument(
+        "--npu_allow_internal_format",
+        type=str,
+        choices=["auto", "true", "false"],
+        default="auto",
+        help=(
+            "Workaround for TorchAIR graph-capture errors with some operators. "
+            "auto: set False during compiled phase on NPU; true/false: force the value."
+        ),
+    )
 
     parser.add_argument("--out_md", type=str, default="out/firered_aed_encoder_decoder_delay.md")
     return parser.parse_args()
@@ -121,6 +133,16 @@ def _synchronize(device: torch.device) -> None:
         torch.npu.synchronize()
     elif device.type == "cuda":
         torch.cuda.synchronize()
+
+
+def _maybe_set_npu_allow_internal_format(value: bool) -> Optional[bool]:
+    if not hasattr(torch, "npu") or not hasattr(torch.npu, "config"):
+        return None
+    if not hasattr(torch.npu.config, "allow_internal_format"):
+        return None
+    old = bool(torch.npu.config.allow_internal_format)
+    torch.npu.config.allow_internal_format = bool(value)
+    return old
 
 
 def _timed_ms(device: torch.device, fn) -> float:
@@ -260,21 +282,54 @@ def main():
         eager_rows.append((case.batch_size, case.length_t, enc_ms, dec_ms))
 
     compiled_rows = []
+    compile_error = None
+    old_allow_internal_format = None
     if args.compile:
         print("\n[phase] compile-kernel setup", flush=True)
-        if hasattr(model.encoder, "reset_kernel"):
-            model.encoder.reset_kernel()
-        if hasattr(model.decoder, "reset_kernel"):
-            model.decoder.reset_kernel()
-        if hasattr(model.encoder, "compile_kernel"):
-            model.encoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
-        if hasattr(model.decoder, "compile_kernel"):
-            model.decoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
 
-        print("\n[phase] compiled", flush=True)
-        for case in cases:
-            enc_ms, dec_ms = run_case(case, "compiled")
-            compiled_rows.append((case.batch_size, case.length_t, enc_ms, dec_ms))
+        if device.type == "npu":
+            desired = None
+            if args.npu_allow_internal_format == "auto":
+                desired = False
+            elif args.npu_allow_internal_format == "true":
+                desired = True
+            elif args.npu_allow_internal_format == "false":
+                desired = False
+
+            if desired is not None:
+                old_allow_internal_format = _maybe_set_npu_allow_internal_format(desired)
+                if old_allow_internal_format is not None:
+                    print(
+                        f"[npu] torch.npu.config.allow_internal_format: {old_allow_internal_format} -> {desired}",
+                        flush=True,
+                    )
+
+        try:
+            if hasattr(model.encoder, "reset_kernel"):
+                model.encoder.reset_kernel()
+            if hasattr(model.decoder, "reset_kernel"):
+                model.decoder.reset_kernel()
+            if hasattr(model.encoder, "compile_kernel"):
+                model.encoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
+            if hasattr(model.decoder, "compile_kernel"):
+                model.decoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
+
+            print("\n[phase] compiled", flush=True)
+            for case in cases:
+                enc_ms, dec_ms = run_case(case, "compiled")
+                compiled_rows.append((case.batch_size, case.length_t, enc_ms, dec_ms))
+        except Exception as e:  # pragma: no cover
+            compile_error = repr(e)
+            print(f"[compile] failed: {compile_error}", flush=True)
+            if "Cannot run aclop operators during NPU graph capture" in compile_error:
+                print(
+                    "[compile] HINT: TorchAIR failed due to aclop operators during graph capture. "
+                    "Try --npu_allow_internal_format false (or keep the default auto).",
+                    flush=True,
+                )
+        finally:
+            if old_allow_internal_format is not None and args.npu_allow_internal_format == "auto":
+                _maybe_set_npu_allow_internal_format(old_allow_internal_format)
 
     out_path = REPO_ROOT / args.out_md
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +350,8 @@ def main():
                 _make_md("", compiled_rows).lstrip(),
             ]
         )
+        if compile_error is not None:
+            md_parts.extend(["", "```", f"compile_error: {compile_error}", "```"])
     md = "\n".join(md_parts).rstrip() + "\n"
     out_path.write_text(md, encoding="utf-8")
     print(f"Wrote: {out_path}")
