@@ -140,15 +140,17 @@ class TransformerDecoder(nn.Module):
         return nbest_hyps
 
     def ignored_target_position_is_0(self, padded_targets, ignore_id):
-        mask = torch.ne(padded_targets, ignore_id)
+        # NOTE: torch_npu/torchair GE converter may fail on `aten.ne.Scalar` when the scalar
+        # becomes symbolic during Dynamo tracing. Force Tensor-Tensor compare on the same device.
+        ignore = padded_targets.new_full((), ignore_id)
+        mask = torch.ne(padded_targets, ignore)
         mask = mask.unsqueeze(dim=1)
         T = padded_targets.size(-1)
-        upper_tri_0_mask = self.upper_triangular_is_0(T).unsqueeze(0).to(mask.dtype)
-        upper_tri_0_mask = upper_tri_0_mask.to(mask.dtype).to(mask.device)
+        upper_tri_0_mask = self.upper_triangular_is_0(T, device=mask.device).unsqueeze(0).to(mask.dtype)
         return mask.to(torch.uint8) & upper_tri_0_mask.to(torch.uint8)
 
-    def upper_triangular_is_0(self, size):
-        ones = torch.ones(size, size)
+    def upper_triangular_is_0(self, size, device=None):
+        ones = torch.ones((size, size), device=device)
         tri_left_ones = torch.tril(ones)
         return tri_left_ones.to(torch.uint8)
 
@@ -165,7 +167,8 @@ class TransformerDecoder(nn.Module):
 
     def get_ys_lengths(self, ys):
         N, B, Tmax = ys.size()
-        ys_lengths = torch.sum(torch.ne(ys, self.eos_id), dim=-1)
+        eos = ys.new_full((), self.eos_id)
+        ys_lengths = torch.sum(torch.ne(ys, eos), dim=-1)
         return ys_lengths.int()
 
 
