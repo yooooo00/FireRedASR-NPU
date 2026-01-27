@@ -65,8 +65,8 @@ def parse_args():
     parser.add_argument("--length_penalty", type=float, default=0.6)
     parser.add_argument("--eos_penalty", type=float, default=1.0)
 
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--iters", type=int, default=1)
 
     parser.add_argument(
         "--cases",
@@ -335,18 +335,13 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     md_parts = [
-        "# 模型推理性能数据汇总表（精简版）",
-        "",
-        "## 一、原始代码推理性能",
-        "",
+        "##原始代码推理性能",
         _make_md("", eager_rows).lstrip(),
     ]
     if args.compile:
         md_parts.extend(
             [
-                "",
-                "## 二、torch.compile 优化后推理性能",
-                "",
+                "##torch.compile 优化后推理性能",
                 _make_md("", compiled_rows).lstrip(),
             ]
         )
