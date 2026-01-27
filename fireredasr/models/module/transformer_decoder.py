@@ -46,6 +46,8 @@ class TransformerDecoder(nn.Module):
         self.run_kernel_v2 = self._run_kernel_v2
 
     def compile_kernel(self, backend=None, dynamic=True, fullgraph=False, mode="reduce-overhead"):
+        if isinstance(mode, str) and mode.lower() in {"none", "default", "auto"}:
+            mode = None
         if backend is None and tng is not None and CompilerConfig is not None:
             config = CompilerConfig()
             config.experimental_config.frozen_parameter = True

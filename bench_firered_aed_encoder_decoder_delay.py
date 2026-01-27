@@ -80,7 +80,20 @@ def parse_args():
     parser.add_argument("--compile", action="store_true", help="Run compiled-kernel benchmark (default on)")
     parser.add_argument("--no-compile", dest="compile", action="store_false")
     parser.set_defaults(compile=True)
-    parser.add_argument("--compile_mode", type=str, default="reduce-overhead")
+    parser.add_argument(
+        "--compile_target",
+        type=str,
+        default="both",
+        choices=["both", "encoder", "decoder"],
+        help="Which kernels to compile (beam search wrapper stays eager).",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["reduce-overhead", "max-autotune", "default", "none"],
+        help="TorchAIR CompilerConfig.mode (default/none means do not set config.mode explicitly).",
+    )
     parser.add_argument("--dynamic", action="store_true", help="torch.compile(dynamic=True)")
     parser.add_argument("--no-dynamic", dest="dynamic", action="store_false")
     # For this benchmark we mostly test fixed shapes, so default to static compilation.
@@ -236,7 +249,7 @@ def main():
 
     print(
         f"bench: #cases={len(cases)} warmup={args.warmup} iters={args.iters} "
-        f"compile={args.compile} dynamic={args.dynamic} fullgraph={args.fullgraph} mode={args.compile_mode}"
+        f"compile={args.compile} target={args.compile_target} dynamic={args.dynamic} fullgraph={args.fullgraph} mode={args.compile_mode}"
     )
 
     def run_case(case: BenchCase, phase: str) -> Tuple[float, float]:
@@ -309,9 +322,10 @@ def main():
                 model.encoder.reset_kernel()
             if hasattr(model.decoder, "reset_kernel"):
                 model.decoder.reset_kernel()
-            if hasattr(model.encoder, "compile_kernel"):
+
+            if args.compile_target in ("both", "encoder") and hasattr(model.encoder, "compile_kernel"):
                 model.encoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
-            if hasattr(model.decoder, "compile_kernel"):
+            if args.compile_target in ("both", "decoder") and hasattr(model.decoder, "compile_kernel"):
                 model.decoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
 
             print("\n[phase] compiled", flush=True)
@@ -335,18 +349,25 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     md_parts = [
-        "##原始代码推理性能",
+        "# 模型推理性能数据汇总表（精简版）",
+        "",
+        "## 一、原始代码推理性能",
+        "",
         _make_md("", eager_rows).lstrip(),
     ]
     if args.compile:
         md_parts.extend(
             [
-                "##torch.compile 优化后推理性能",
+                "",
+                "## 二、torch.compile 优化后推理性能",
+                "",
                 _make_md("", compiled_rows).lstrip(),
             ]
         )
+        meta_lines = [f"compile_target: {args.compile_target}"]
         if compile_error is not None:
-            md_parts.extend(["", "```", f"compile_error: {compile_error}", "```"])
+            meta_lines.append(f"compile_error: {compile_error}")
+        md_parts.extend(["", "```", *meta_lines, "```"])
     md = "\n".join(md_parts).rstrip() + "\n"
     out_path.write_text(md, encoding="utf-8")
     print(f"Wrote: {out_path}")

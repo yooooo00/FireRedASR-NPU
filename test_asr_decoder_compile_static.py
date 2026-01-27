@@ -170,8 +170,11 @@ def _get_npu_backend(args):
         return None
     config = CompilerConfig()
     config.experimental_config.frozen_parameter = True
-    if args.compile_mode:
-        config.mode = args.compile_mode
+    mode = args.compile_mode
+    if isinstance(mode, str) and mode.lower() in {"none", "default", "auto"}:
+        mode = None
+    if mode:
+        config.mode = mode
     return tng.get_npu_backend(compiler_config=config)
 
 

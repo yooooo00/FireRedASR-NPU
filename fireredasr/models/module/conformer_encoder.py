@@ -31,6 +31,8 @@ class ConformerEncoder(nn.Module):
         self.run_layers = self._run_layers
 
     def compile_kernel(self, backend=None, dynamic=True, fullgraph=False, mode="reduce-overhead"):
+        if isinstance(mode, str) and mode.lower() in {"none", "default", "auto"}:
+            mode = None
         if backend is None and tng is not None and CompilerConfig is not None:
             config = CompilerConfig()
             config.experimental_config.frozen_parameter = True
