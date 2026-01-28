@@ -44,6 +44,7 @@ class TransformerDecoder(nn.Module):
 
         self.run_kernel_v1 = self._run_kernel_v1
         self.run_kernel_v2 = self._run_kernel_v2
+        self._prefer_kernel_v2 = False
 
     def compile_kernel(self, backend=None, dynamic=True, fullgraph=False, mode="reduce-overhead"):
         if isinstance(mode, str) and mode.lower() in {"none", "default", "auto"}:
@@ -65,10 +66,12 @@ class TransformerDecoder(nn.Module):
             self.run_kernel_v2 = torch.compile(
                 self._run_kernel_v2, dynamic=dynamic, fullgraph=fullgraph, backend=backend
             )
+        self._prefer_kernel_v2 = True
 
     def reset_kernel(self):
         self.run_kernel_v1 = self._run_kernel_v1
         self.run_kernel_v2 = self._run_kernel_v2
+        self._prefer_kernel_v2 = False
 
     def _run_kernel_v1(self, dec_output, encoder_outputs, tgt_mask, src_mask, caches):
         i = 0
@@ -84,7 +87,7 @@ class TransformerDecoder(nn.Module):
             i += 1
         return dec_output, caches
 
-    def _run_kernel_v2(self, dec_output, encoder_outputs, tgt_mask, src_mask, caches, t):
+    def _run_kernel_v2(self, dec_output, encoder_outputs, tgt_mask, src_mask, caches):
         i = 0
         for dec_layer in self.layer_stack:
             dec_output = dec_layer.forward_v2(
@@ -93,7 +96,6 @@ class TransformerDecoder(nn.Module):
                 tgt_mask,
                 src_mask,
                 cache=caches[i],
-                t=t,
             )
             i += 1
         return dec_output, caches
@@ -109,11 +111,10 @@ class TransformerDecoder(nn.Module):
         assert eos_penalty > 0.0 and eos_penalty <= 1.0
 
         # Init
-        use_version_2 = Ti > 152
+        use_version_2 = self._prefer_kernel_v2 or (Ti > 152)
         encoder_outputs = encoder_outputs.unsqueeze(1).repeat(1, B, 1, 1).view(N*B, Ti, H)
         src_mask = src_masks.unsqueeze(1).repeat(1, B, 1, 1).view(N*B, -1, Ti)
         ys = torch.ones(N*B, 1).fill_(self.sos_id).long().to(device)
-        input_tgt_mask = torch.ones(1, maxlen, device=device, dtype=torch.uint8)
         stride = B * torch.arange(N, device=device).view(N, 1).repeat(1, B).view(N * B)
         if use_version_2:
             caches = [torch.zeros((N * B, maxlen, H), device=device, dtype=encoder_outputs.dtype) for _ in range(self.n_layers)]
@@ -127,15 +128,15 @@ class TransformerDecoder(nn.Module):
         # Autoregressive Prediction
         for t in range(maxlen):
             # In incremental decoding (q = last token), there is no "future token" in K/V,
-            # so a simple all-ones mask is sufficient and avoids building large triangular masks.
-            tgt_mask = input_tgt_mask[:, : t + 1].unsqueeze(1).expand(N * B, 1, t + 1)
+            # so we can skip the causal mask entirely.
+            tgt_mask = None
 
             dec_output = self.dropout(
                 self.tgt_word_emb(ys) * self.scale +
                 self.positional_encoding(ys))
 
             if use_version_2:
-                dec_output, caches = self.run_kernel_v2(dec_output, encoder_outputs, tgt_mask, src_mask, caches, t)
+                dec_output, caches = self.run_kernel_v2(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
             else:
                 dec_output, caches = self.run_kernel_v1(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
 
@@ -257,7 +258,8 @@ class DecoderLayer(nn.Module):
         if cache is not None:
             xq = x[:, -1:, :]
             residual = residual[:, -1:, :]
-            self_attn_mask = self_attn_mask[:, -1:, :]
+            if self_attn_mask is not None:
+                self_attn_mask = self_attn_mask[:, -1:, :]
         else:
             xq = x
         x = self.self_attn(xq, x, x, mask=self_attn_mask)
@@ -277,16 +279,15 @@ class DecoderLayer(nn.Module):
 
         return x
 
-    def forward_v2(self, dec_input, enc_output, self_attn_mask, cross_attn_mask, cache, t):
+    def forward_v2(self, dec_input, enc_output, self_attn_mask, cross_attn_mask, cache):
+        t = dec_input.size(1) - 1
         x = dec_input
         residual = x
         x = self.self_attn_norm(x)
-        if t > 0:
-            xq = x[:, -1:, :]
-            residual = residual[:, -1:, :]
+        xq = x[:, -1:, :]
+        residual = residual[:, -1:, :]
+        if self_attn_mask is not None:
             self_attn_mask = self_attn_mask[:, -1:, :]
-        else:
-            xq = x
         x = self.self_attn(xq, x, x, mask=self_attn_mask)
         x = residual + x
 
@@ -348,14 +349,22 @@ class DecoderScaledDotProductAttention(nn.Module):
         self.INF = float("inf")
 
     def forward(self, q, k, v, mask=None):
-        attn = torch.matmul(q, k.transpose(2, 3)) / self.temperature
+        # Avoid 4D torch.matmul broadcasting paths (may trigger aten.expand/reshape patterns
+        # that some TorchAIR backends cannot lower under dynamic shapes).
+        bs, n_head, lq, d_k = q.shape
+        lk = k.size(2)
+        q_ = q.reshape(bs * n_head, lq, d_k)
+        k_ = k.reshape(bs * n_head, lk, d_k)
+        attn = torch.bmm(q_, k_.transpose(1, 2)).view(bs, n_head, lq, lk) / self.temperature
         if mask is not None:
             mask = mask.eq(0)
             attn = attn.masked_fill(mask, -self.INF)
             attn = torch.softmax(attn, dim=-1).masked_fill(mask, 0.0)
         else:
             attn = torch.softmax(attn, dim=-1)
-        output = torch.matmul(attn, v)
+        attn_ = attn.reshape(bs * n_head, lq, lk)
+        v_ = v.reshape(bs * n_head, lk, d_k)
+        output = torch.bmm(attn_, v_).view(bs, n_head, lq, d_k)
         return output
 
 
