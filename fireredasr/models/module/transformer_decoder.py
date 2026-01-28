@@ -100,7 +100,8 @@ class TransformerDecoder(nn.Module):
 
     def batch_beam_search(self, encoder_outputs, src_masks,
                    beam_size=1, nbest=1, decode_max_len=0,
-                   softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0):
+                   softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0,
+                   disable_early_stop: bool = False):
         B = beam_size
         N, Ti, H = encoder_outputs.size()
         device = encoder_outputs.device
@@ -171,8 +172,9 @@ class TransformerDecoder(nn.Module):
 
             # Update finished state
             is_finished = t_ys.eq(self.eos_id)
-            if is_finished.sum().item() == N * B:
-                break
+            if not disable_early_stop:
+                if is_finished.sum().item() == N * B:
+                    break
 
         # Length penalty (follow GNMT)
         scores = scores.view(N, B)

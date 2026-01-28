@@ -64,6 +64,11 @@ def parse_args():
     parser.add_argument("--softmax_smoothing", type=float, default=1.25)
     parser.add_argument("--length_penalty", type=float, default=0.6)
     parser.add_argument("--eos_penalty", type=float, default=1.0)
+    parser.add_argument(
+        "--disable_early_stop",
+        action="store_true",
+        help="Do not break early when all beams finished (avoids per-step .item() sync).",
+    )
 
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=1)
@@ -96,8 +101,8 @@ def parse_args():
     )
     parser.add_argument("--dynamic", action="store_true", help="torch.compile(dynamic=True)")
     parser.add_argument("--no-dynamic", dest="dynamic", action="store_false")
-    # For this benchmark we mostly test fixed shapes, so default to static compilation.
-    parser.set_defaults(dynamic=False)
+    # Decoder sees variable-length (t+1) during autoregressive decoding; dynamic=True avoids recompiles.
+    parser.set_defaults(dynamic=True)
     parser.add_argument("--fullgraph", action="store_true", help="torch.compile(fullgraph=True)")
 
     parser.add_argument(
@@ -249,7 +254,8 @@ def main():
 
     print(
         f"bench: #cases={len(cases)} warmup={args.warmup} iters={args.iters} "
-        f"compile={args.compile} target={args.compile_target} dynamic={args.dynamic} fullgraph={args.fullgraph} mode={args.compile_mode}"
+        f"compile={args.compile} target={args.compile_target} dynamic={args.dynamic} fullgraph={args.fullgraph} "
+        f"mode={args.compile_mode} disable_early_stop={args.disable_early_stop}"
     )
 
     def run_case(case: BenchCase, phase: str) -> Tuple[float, float]:
@@ -282,6 +288,7 @@ def main():
                     args.softmax_smoothing,
                     args.length_penalty,
                     args.eos_penalty,
+                    disable_early_stop=args.disable_early_stop,
                 )
 
         dec_ms = _bench_ms(device, dec_step, args.warmup, args.iters)

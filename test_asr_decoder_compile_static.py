@@ -47,6 +47,11 @@ def parse_args():
     parser.add_argument("--softmax_smoothing", type=float, default=1.25)
     parser.add_argument("--length_penalty", type=float, default=0.6)
     parser.add_argument("--eos_penalty", type=float, default=1.0)
+    parser.add_argument(
+        "--disable_early_stop",
+        action="store_true",
+        help="Do not break early when all beams finished (avoids per-step .item() sync).",
+    )
 
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -301,6 +306,7 @@ def main():
                 args.softmax_smoothing,
                 args.length_penalty,
                 args.eos_penalty,
+                disable_early_stop=args.disable_early_stop,
             )
 
     eager_stats = _bench("eager", device, run_decode, args.warmup, args.iters)
