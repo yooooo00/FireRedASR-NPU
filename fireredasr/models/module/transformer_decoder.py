@@ -6,6 +6,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 try:
+    import torch_npu  # noqa: F401
+except ModuleNotFoundError:  # pragma: no cover
+    torch_npu = None
+
+try:
     import torchair as tng
     from torchair import CompilerConfig
 except ModuleNotFoundError:  # pragma: no cover
@@ -372,7 +377,7 @@ class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
-        self.act = nn.GELU()
+        self.act = NpuGELU() if torch_npu is not None else nn.GELU()
         self.w_2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -380,6 +385,17 @@ class PositionwiseFeedForward(nn.Module):
         output = self.w_2(self.act(self.w_1(x)))
         output = self.dropout(output)
         return output
+
+
+class NpuGELU(nn.Module):
+    def __init__(self, approximate: str = "tanh"):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x: Tensor) -> Tensor:
+        if torch_npu is None:  # pragma: no cover
+            return F.gelu(x, approximate=self.approximate)
+        return torch_npu.npu_gelu(x, approximate=self.approximate)
 
 
 class PositionalEncoding(nn.Module):
