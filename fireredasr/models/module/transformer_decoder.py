@@ -320,8 +320,8 @@ class DecoderMultiHeadAttention(nn.Module):
         self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(d_model, n_head * self.d_k)
 
-        self.attention = DecoderScaledDotProductAttention(
-            temperature=self.d_k ** 0.5)
+        self._use_sdpa = hasattr(F, "scaled_dot_product_attention")
+        self.attention = DecoderScaledDotProductAttention(temperature=self.d_k ** 0.5)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -335,10 +335,17 @@ class DecoderMultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if mask is not None:
-            mask = mask.unsqueeze(1)
-
-        output = self.attention(q, k, v, mask=mask)
+        if self._use_sdpa:
+            attn_mask = None
+            if mask is not None:
+                # incoming mask is "valid positions" (True/1 keeps, False/0 masks)
+                mask_bool = mask.to(torch.bool)
+                attn_mask = (~mask_bool).unsqueeze(1)  # [B,1,1,S], broadcast over heads and query length
+            output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        else:
+            if mask is not None:
+                mask = mask.unsqueeze(1)
+            output = self.attention(q, k, v, mask=mask)
 
         output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         output = self.fc(output)
