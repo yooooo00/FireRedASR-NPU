@@ -115,6 +115,20 @@ def parse_args():
             "auto: set False during compiled phase on NPU; true/false: force the value."
         ),
     )
+    parser.add_argument(
+        "--aclgraph_static_capture_size_limit",
+        type=int,
+        default=None,
+        help=(
+            "Best-effort: increase TorchAIR ACLGraph static_capture_size_limit to avoid "
+            "falling back to eager when many shapes are seen (e.g., autoregressive decoding)."
+        ),
+    )
+    parser.add_argument(
+        "--aclgraph_enable_output_clone",
+        action="store_true",
+        help="Best-effort: set debug.aclgraph.enable_output_clone=True to avoid output retention hazards.",
+    )
 
     parser.add_argument("--out_md", type=str, default="out/firered_aed_encoder_decoder_delay.md")
     return parser.parse_args()
@@ -161,6 +175,38 @@ def _maybe_set_npu_allow_internal_format(value: bool) -> Optional[bool]:
     old = bool(torch.npu.config.allow_internal_format)
     torch.npu.config.allow_internal_format = bool(value)
     return old
+
+
+def _maybe_set_torchair_aclgraph_option(name: str, value) -> bool:
+    # TorchAIR config layout differs across versions. Try a few common module paths.
+    candidates = []
+    try:  # pragma: no cover
+        import torch_npu.dynamo.torchair.configs as cfg  # noqa: WPS433
+
+        candidates.append(cfg)
+    except Exception:
+        pass
+    try:  # pragma: no cover
+        import torchair.configs as cfg  # noqa: WPS433
+
+        candidates.append(cfg)
+    except Exception:
+        pass
+
+    for cfg in candidates:
+        debug = getattr(cfg, "debug", None)
+        if debug is None:
+            continue
+        aclgraph = getattr(debug, "aclgraph", None)
+        if aclgraph is None:
+            continue
+        if hasattr(aclgraph, name):
+            try:
+                setattr(aclgraph, name, value)
+                return True
+            except Exception:
+                return False
+    return False
 
 
 def _timed_ms(device: torch.device, fn) -> float:
@@ -323,6 +369,18 @@ def main():
                         f"[npu] torch.npu.config.allow_internal_format: {old_allow_internal_format} -> {desired}",
                         flush=True,
                     )
+
+            if args.aclgraph_static_capture_size_limit is not None:
+                ok = _maybe_set_torchair_aclgraph_option(
+                    "static_capture_size_limit", int(args.aclgraph_static_capture_size_limit)
+                )
+                print(
+                    f"[npu] debug.aclgraph.static_capture_size_limit={args.aclgraph_static_capture_size_limit} (set={ok})",
+                    flush=True,
+                )
+            if args.aclgraph_enable_output_clone:
+                ok = _maybe_set_torchair_aclgraph_option("enable_output_clone", True)
+                print(f"[npu] debug.aclgraph.enable_output_clone=True (set={ok})", flush=True)
 
         try:
             if hasattr(model.encoder, "reset_kernel"):

@@ -320,10 +320,23 @@ class DecoderMultiHeadAttention(nn.Module):
         self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(d_model, n_head * self.d_k)
 
-        self._use_sdpa = hasattr(F, "scaled_dot_product_attention")
+        self._use_sdpa_eager = hasattr(F, "scaled_dot_product_attention")
         self.attention = DecoderScaledDotProductAttention(temperature=self.d_k ** 0.5)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
         self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _is_compiling() -> bool:
+        try:
+            import torch._dynamo  # noqa: WPS433
+
+            return bool(torch._dynamo.is_compiling())
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            return bool(torch.compiler.is_compiling())
+        except Exception:  # pragma: no cover
+            return False
 
     def forward(self, q, k, v, mask=None):
         bs = q.size(0)
@@ -335,7 +348,10 @@ class DecoderMultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if self._use_sdpa:
+        # NOTE: torch_npu's SDPA may not be traceable under Dynamo with symbolic sizes
+        # (e.g., it may call storage_offset() in a way FakeTensor can't support). Use SDPA
+        # only in eager; use the matmul/bmm-based attention under torch.compile.
+        if self._use_sdpa_eager and (not self._is_compiling()):
             attn_mask = None
             if mask is not None:
                 # incoming mask is "valid positions" (True/1 keeps, False/0 masks)
