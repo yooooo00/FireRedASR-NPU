@@ -178,34 +178,61 @@ def _maybe_set_npu_allow_internal_format(value: bool) -> Optional[bool]:
 
 
 def _maybe_set_torchair_aclgraph_option(name: str, value) -> bool:
-    # TorchAIR config layout differs across versions. Try a few common module paths.
-    candidates = []
-    try:  # pragma: no cover
-        import torch_npu.dynamo.torchair.configs as cfg  # noqa: WPS433
+    # TorchAIR config layout differs across versions. Try multiple import paths and finally
+    # scan already-loaded modules for something that looks like `debug.aclgraph`.
+    import importlib
+    import sys
 
-        candidates.append(cfg)
-    except Exception:
-        pass
-    try:  # pragma: no cover
-        import torchair.configs as cfg  # noqa: WPS433
-
-        candidates.append(cfg)
-    except Exception:
-        pass
-
-    for cfg in candidates:
-        debug = getattr(cfg, "debug", None)
+    def _try_set(mod) -> Optional[bool]:
+        debug = getattr(mod, "debug", None)
         if debug is None:
-            continue
+            return None
         aclgraph = getattr(debug, "aclgraph", None)
         if aclgraph is None:
+            return None
+        if not hasattr(aclgraph, name):
+            return None
+        try:
+            setattr(aclgraph, name, value)
+            return True
+        except Exception:
+            return False
+
+    module_names = [
+        # Most common public-ish entrypoints
+        "torchair.configs",
+        "torchair",
+        # torch_npu packaged torchair
+        "torch_npu.dynamo.torchair.configs",
+        "torch_npu.dynamo.torchair",
+        "torch_npu.torchair.configs",
+        "torch_npu.torchair",
+    ]
+    for mod_name in module_names:
+        try:  # pragma: no cover
+            mod = importlib.import_module(mod_name)
+        except Exception:
             continue
-        if hasattr(aclgraph, name):
-            try:
-                setattr(aclgraph, name, value)
-                return True
-            except Exception:
-                return False
+        ok = _try_set(mod)
+        if ok is not None:
+            return bool(ok)
+        configs = getattr(mod, "configs", None)
+        if configs is not None:
+            ok = _try_set(configs)
+            if ok is not None:
+                return bool(ok)
+
+    # Last resort: scan loaded modules (keeps it cheap; avoids walking pkgutil).
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        mod_name = getattr(mod, "__name__", "")
+        if "torchair" not in mod_name:
+            continue
+        ok = _try_set(mod)
+        if ok is not None:
+            return bool(ok)
+
     return False
 
 
