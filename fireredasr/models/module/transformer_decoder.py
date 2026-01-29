@@ -51,7 +51,15 @@ class TransformerDecoder(nn.Module):
         self.run_kernel_v2 = self._run_kernel_v2
         self._prefer_kernel_v2 = False
 
-    def compile_kernel(self, backend=None, dynamic=True, fullgraph=False, mode="reduce-overhead"):
+    def compile_kernel(
+        self,
+        backend=None,
+        dynamic=True,
+        fullgraph=False,
+        mode="reduce-overhead",
+        aclgraph_static_capture_size_limit: Optional[int] = None,
+        aclgraph_enable_output_clone: bool = False,
+    ):
         if isinstance(mode, str) and mode.lower() in {"none", "default", "auto"}:
             mode = None
         if backend is None and tng is not None and CompilerConfig is not None:
@@ -59,6 +67,44 @@ class TransformerDecoder(nn.Module):
             config.experimental_config.frozen_parameter = True
             if mode is not None:
                 config.mode = mode
+            _set_limit = None
+            if aclgraph_static_capture_size_limit is not None:
+                try:
+                    config.debug.aclgraph.static_capture_size_limit = int(aclgraph_static_capture_size_limit)
+                    _set_limit = True
+                except Exception:  # pragma: no cover
+                    _set_limit = False
+            _set_clone = None
+            if aclgraph_enable_output_clone:
+                try:
+                    config.debug.aclgraph.enable_output_clone = True
+                    _set_clone = True
+                except Exception:  # pragma: no cover
+                    _set_clone = False
+            if aclgraph_static_capture_size_limit is not None or aclgraph_enable_output_clone:
+                try:
+                    print(
+                        f"[torchair] aclgraph.static_capture_size_limit={aclgraph_static_capture_size_limit} (set={_set_limit}) "
+                        f"enable_output_clone={bool(aclgraph_enable_output_clone)} (set={_set_clone})",
+                        flush=True,
+                    )
+                    if (_set_limit is False) or (_set_clone is False):
+                        debug = getattr(config, "debug", None)
+                        aclgraph = getattr(debug, "aclgraph", None) if debug is not None else None
+                        print(
+                            f"[torchair] debug={debug is not None} aclgraph={aclgraph is not None}",
+                            flush=True,
+                        )
+                        if aclgraph is not None:
+                            keys = [
+                                k
+                                for k in dir(aclgraph)
+                                if ("capture" in k) or ("clone" in k) or ("limit" in k)
+                            ]
+                            keys = [k for k in keys if not k.startswith("_")]
+                            print(f"[torchair] debug.aclgraph keys: {sorted(keys)}", flush=True)
+                except Exception:  # pragma: no cover
+                    pass
             backend = tng.get_npu_backend(compiler_config=config)
 
         if backend is None:

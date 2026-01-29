@@ -397,17 +397,13 @@ def main():
                         flush=True,
                     )
 
-            if args.aclgraph_static_capture_size_limit is not None:
-                ok = _maybe_set_torchair_aclgraph_option(
-                    "static_capture_size_limit", int(args.aclgraph_static_capture_size_limit)
-                )
+            if args.aclgraph_static_capture_size_limit is not None or args.aclgraph_enable_output_clone:
                 print(
-                    f"[npu] debug.aclgraph.static_capture_size_limit={args.aclgraph_static_capture_size_limit} (set={ok})",
+                    f"[npu] request aclgraph options via CompilerConfig: "
+                    f"static_capture_size_limit={args.aclgraph_static_capture_size_limit} "
+                    f"enable_output_clone={bool(args.aclgraph_enable_output_clone)}",
                     flush=True,
                 )
-            if args.aclgraph_enable_output_clone:
-                ok = _maybe_set_torchair_aclgraph_option("enable_output_clone", True)
-                print(f"[npu] debug.aclgraph.enable_output_clone=True (set={ok})", flush=True)
 
         try:
             if hasattr(model.encoder, "reset_kernel"):
@@ -416,9 +412,21 @@ def main():
                 model.decoder.reset_kernel()
 
             if args.compile_target in ("both", "encoder") and hasattr(model.encoder, "compile_kernel"):
-                model.encoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
+                model.encoder.compile_kernel(
+                    dynamic=args.dynamic,
+                    fullgraph=args.fullgraph,
+                    mode=args.compile_mode,
+                    aclgraph_static_capture_size_limit=args.aclgraph_static_capture_size_limit,
+                    aclgraph_enable_output_clone=bool(args.aclgraph_enable_output_clone),
+                )
             if args.compile_target in ("both", "decoder") and hasattr(model.decoder, "compile_kernel"):
-                model.decoder.compile_kernel(dynamic=args.dynamic, fullgraph=args.fullgraph, mode=args.compile_mode)
+                model.decoder.compile_kernel(
+                    dynamic=args.dynamic,
+                    fullgraph=args.fullgraph,
+                    mode=args.compile_mode,
+                    aclgraph_static_capture_size_limit=args.aclgraph_static_capture_size_limit,
+                    aclgraph_enable_output_clone=bool(args.aclgraph_enable_output_clone),
+                )
 
             print("\n[phase] compiled", flush=True)
             for case in cases:
