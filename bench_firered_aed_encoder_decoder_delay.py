@@ -143,6 +143,11 @@ def parse_args():
         action="store_true",
         help="Debug only: synchronize and print per-step kernel time (very slow).",
     )
+    parser.add_argument(
+        "--decoder_use_kv_cache",
+        action="store_true",
+        help="Use incremental step-kernel with KV cache (route1).",
+    )
     return parser.parse_args()
 
 
@@ -340,7 +345,8 @@ def main():
     print(
         f"bench: #cases={len(cases)} warmup={args.warmup} iters={args.iters} "
         f"compile={args.compile} target={args.compile_target} dynamic={args.dynamic} fullgraph={args.fullgraph} "
-        f"mode={args.compile_mode} disable_early_stop={args.disable_early_stop}"
+        f"mode={args.compile_mode} disable_early_stop={args.disable_early_stop} "
+        f"decoder_use_kv_cache={bool(args.decoder_use_kv_cache)}"
     )
 
     def run_case(case: BenchCase, phase: str) -> Tuple[float, float]:
@@ -374,6 +380,7 @@ def main():
                     args.length_penalty,
                     args.eos_penalty,
                     disable_early_stop=args.disable_early_stop,
+                    use_kv_cache=bool(args.decoder_use_kv_cache),
                     debug_progress_every=int(args.decoder_debug_every),
                     debug_step_timing=bool(args.decoder_debug_step_timing),
                 )
@@ -421,6 +428,7 @@ def main():
                 if (
                     args.compile_mode == "reduce-overhead"
                     and args.compile_target in ("decoder", "both")
+                    and not bool(args.decoder_use_kv_cache)
                     and args.dynamic
                     and args.aclgraph_static_capture_size_limit
                     and int(args.aclgraph_static_capture_size_limit) > 64
@@ -453,6 +461,8 @@ def main():
                     mode=args.compile_mode,
                     aclgraph_static_capture_size_limit=args.aclgraph_static_capture_size_limit,
                     aclgraph_enable_output_clone=bool(args.aclgraph_enable_output_clone),
+                    compile_prefix_kernels=not bool(args.decoder_use_kv_cache),
+                    compile_kv_cache_step=bool(args.decoder_use_kv_cache),
                 )
 
             print("\n[phase] compiled", flush=True)

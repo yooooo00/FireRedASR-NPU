@@ -1,5 +1,5 @@
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,8 @@ class TransformerDecoder(nn.Module):
         self.sos_id = sos_id
         self.eos_id = eos_id
         self.n_layers = n_layers
+        self.n_head = n_head
+        self.d_model = d_model
 
         # Components
         self.tgt_word_emb = nn.Embedding(odim, d_model, padding_idx=self.pad_id)
@@ -50,6 +52,7 @@ class TransformerDecoder(nn.Module):
 
         self.run_kernel_v1 = self._run_kernel_v1
         self.run_kernel_v2 = self._run_kernel_v2
+        self.run_step_kv = self._run_step_kv
         self._prefer_kernel_v2 = False
 
     def compile_kernel(
@@ -60,6 +63,8 @@ class TransformerDecoder(nn.Module):
         mode="reduce-overhead",
         aclgraph_static_capture_size_limit: Optional[int] = None,
         aclgraph_enable_output_clone: bool = False,
+        compile_prefix_kernels: bool = True,
+        compile_kv_cache_step: bool = False,
     ):
         if isinstance(mode, str) and mode.lower() in {"none", "default", "auto"}:
             mode = None
@@ -109,20 +114,31 @@ class TransformerDecoder(nn.Module):
             backend = tng.get_npu_backend(compiler_config=config)
 
         if backend is None:
-            self.run_kernel_v1 = torch.compile(self._run_kernel_v1, dynamic=dynamic, fullgraph=fullgraph)
-            self.run_kernel_v2 = torch.compile(self._run_kernel_v2, dynamic=dynamic, fullgraph=fullgraph)
+            if compile_prefix_kernels:
+                self.run_kernel_v1 = torch.compile(self._run_kernel_v1, dynamic=dynamic, fullgraph=fullgraph)
+                self.run_kernel_v2 = torch.compile(self._run_kernel_v2, dynamic=dynamic, fullgraph=fullgraph)
+            if compile_kv_cache_step:
+                # Fixed-shape step kernel; do not enable dynamic shapes here.
+                self.run_step_kv = torch.compile(self._run_step_kv, dynamic=False, fullgraph=fullgraph)
         else:
-            self.run_kernel_v1 = torch.compile(
-                self._run_kernel_v1, dynamic=dynamic, fullgraph=fullgraph, backend=backend
-            )
-            self.run_kernel_v2 = torch.compile(
-                self._run_kernel_v2, dynamic=dynamic, fullgraph=fullgraph, backend=backend
-            )
-        self._prefer_kernel_v2 = True
+            if compile_prefix_kernels:
+                self.run_kernel_v1 = torch.compile(
+                    self._run_kernel_v1, dynamic=dynamic, fullgraph=fullgraph, backend=backend
+                )
+                self.run_kernel_v2 = torch.compile(
+                    self._run_kernel_v2, dynamic=dynamic, fullgraph=fullgraph, backend=backend
+                )
+            if compile_kv_cache_step:
+                # Fixed-shape step kernel; do not enable dynamic shapes here.
+                self.run_step_kv = torch.compile(
+                    self._run_step_kv, dynamic=False, fullgraph=fullgraph, backend=backend
+                )
+        self._prefer_kernel_v2 = bool(compile_prefix_kernels)
 
     def reset_kernel(self):
         self.run_kernel_v1 = self._run_kernel_v1
         self.run_kernel_v2 = self._run_kernel_v2
+        self.run_step_kv = self._run_step_kv
         self._prefer_kernel_v2 = False
 
     def _run_kernel_v1(self, dec_output, encoder_outputs, tgt_mask, src_mask, caches):
@@ -152,10 +168,40 @@ class TransformerDecoder(nn.Module):
             i += 1
         return dec_output, caches
 
+    def _run_step_kv(
+        self,
+        x_t: Tensor,
+        encoder_outputs: Tensor,
+        src_mask: Tensor,
+        self_k_cache: Tensor,
+        self_v_cache: Tensor,
+        enc_k_cache: Tensor,
+        enc_v_cache: Tensor,
+        step_idx: Tensor,
+        self_attn_mask: Tensor,
+    ) -> Tensor:
+        i = 0
+        for dec_layer in self.layer_stack:
+            x_t = dec_layer.forward_incremental(
+                x_t,
+                encoder_outputs,
+                cross_attn_mask=src_mask,
+                self_k_cache=self_k_cache[i],
+                self_v_cache=self_v_cache[i],
+                enc_k_cache=enc_k_cache[i],
+                enc_v_cache=enc_v_cache[i],
+                step_idx=step_idx,
+                self_attn_mask=self_attn_mask,
+            )
+            i += 1
+        x_t = self.layer_norm_out(x_t)
+        return x_t
+
     def batch_beam_search(self, encoder_outputs, src_masks,
                    beam_size=1, nbest=1, decode_max_len=0,
                    softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0,
                    disable_early_stop: bool = False,
+                   use_kv_cache: bool = False,
                    debug_progress_every: int = 0,
                    debug_step_timing: bool = False):
         B = beam_size
@@ -170,61 +216,140 @@ class TransformerDecoder(nn.Module):
         src_mask = src_masks.unsqueeze(1).repeat(1, B, 1, 1).view(N*B, -1, Ti)
         ys = torch.ones(N*B, 1).fill_(self.sos_id).long().to(device)
         stride = B * torch.arange(N, device=device).view(N, 1).repeat(1, B).view(N * B)
-        if use_version_2:
-            caches = [torch.zeros((N * B, maxlen, H), device=device, dtype=encoder_outputs.dtype) for _ in range(self.n_layers)]
-        else:
-            caches = [torch.empty((N * B, 0, H), device=device, dtype=encoder_outputs.dtype) for _ in range(self.n_layers)]
+        caches = None
+        if not use_kv_cache:
+            if use_version_2:
+                caches = [
+                    torch.zeros((N * B, maxlen, H), device=device, dtype=encoder_outputs.dtype)
+                    for _ in range(self.n_layers)
+                ]
+            else:
+                caches = [
+                    torch.empty((N * B, 0, H), device=device, dtype=encoder_outputs.dtype)
+                    for _ in range(self.n_layers)
+                ]
         scores_temp = torch.tensor([0.0] + [-self.INF] * (B - 1), device=device).float()
         scores = scores_temp.repeat(N).view(N * B, 1)
         mask_score = scores_temp.view(1, B).repeat(N * B, 1)
         is_finished = torch.zeros_like(scores)
 
         # Autoregressive Prediction
+        if use_kv_cache:
+            # Per-step mask for self-attn KV caches: 1 means valid, 0 means masked.
+            self_attn_mask = torch.zeros((N * B, 1, maxlen), device=device, dtype=torch.uint8)
+            step_idx = torch.zeros((1,), device=device, dtype=torch.long)
+
+            # Self-attn KV caches per layer: [L, NB, n_head, maxlen, d_k]
+            n_head = self.layer_stack[0].self_attn.n_head
+            d_k = self.layer_stack[0].self_attn.d_k
+            self_k_cache = torch.zeros(
+                (self.n_layers, N * B, n_head, maxlen, d_k),
+                device=device,
+                dtype=encoder_outputs.dtype,
+            )
+            self_v_cache = torch.zeros_like(self_k_cache)
+
+            # Cross-attn KV caches per layer: [L, NB, n_head, Ti, d_k] (fixed across steps).
+            enc_k_list: List[Tensor] = []
+            enc_v_list: List[Tensor] = []
+            for dec_layer in self.layer_stack:
+                k_l, v_l = dec_layer.cross_attn.project_kv(encoder_outputs)
+                enc_k_list.append(k_l)
+                enc_v_list.append(v_l)
+            enc_k_cache = torch.stack(enc_k_list, dim=0)
+            enc_v_cache = torch.stack(enc_v_list, dim=0)
+
+            # Stable input buffer for compiled step kernel.
+            x_t_buf = torch.empty((N * B, 1, H), device=device, dtype=encoder_outputs.dtype)
+            t_ys = ys  # current token ids, shape [NB,1]
         for t in range(maxlen):
             # In incremental decoding (q = last token), there is no "future token" in K/V,
             # so we can skip the causal mask entirely.
             tgt_mask = None
 
-            dec_output = self.dropout(
-                self.tgt_word_emb(ys) * self.scale +
-                self.positional_encoding(ys))
-
+            impl = "kv" if use_kv_cache else ("v2" if use_version_2 else "v1")
             if debug_progress_every and (t == 0 or (t % int(debug_progress_every) == 0)):
                 try:
                     print(
-                        f"[decoder] t={t} ys={tuple(ys.shape)} use_v2={bool(use_version_2)}",
+                        f"[decoder] t={t} ys={tuple(ys.shape)} impl={impl}",
                         flush=True,
                     )
                 except Exception:  # pragma: no cover
                     pass
 
-            _t0 = None
-            if debug_step_timing:
-                try:
-                    if device.type == "npu" and hasattr(torch, "npu"):
-                        torch.npu.synchronize()
-                    _t0 = time.time()
-                except Exception:  # pragma: no cover
-                    _t0 = None
+            if use_kv_cache:
+                # Update mask and step index (shape-stable tensors).
+                step_idx.fill_(t)
+                self_attn_mask[:, :, t] = 1
 
-            if use_version_2:
-                dec_output, caches = self.run_kernel_v2(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
+                pos_t = self.positional_encoding.pe[:, t : t + 1]
+                x_t = self.dropout(self.tgt_word_emb(t_ys) * self.scale + pos_t)
+                x_t_buf.copy_(x_t)
+
+                _t0 = None
+                if debug_step_timing:
+                    try:
+                        if device.type == "npu" and hasattr(torch, "npu"):
+                            torch.npu.synchronize()
+                        _t0 = time.time()
+                    except Exception:  # pragma: no cover
+                        _t0 = None
+
+                dec_output = self.run_step_kv(
+                    x_t_buf,
+                    encoder_outputs,
+                    src_mask,
+                    self_k_cache,
+                    self_v_cache,
+                    enc_k_cache,
+                    enc_v_cache,
+                    step_idx,
+                    self_attn_mask,
+                )
+
+                if _t0 is not None and debug_step_timing:
+                    try:
+                        if device.type == "npu" and hasattr(torch, "npu"):
+                            torch.npu.synchronize()
+                        _dt_ms = (time.time() - _t0) * 1000.0
+                        if debug_progress_every and (t == 0 or (t % int(debug_progress_every) == 0)):
+                            print(f"[decoder] t={t} kernel_ms={_dt_ms:.3f}", flush=True)
+                    except Exception:  # pragma: no cover
+                        pass
+
+                t_logit = self.tgt_word_prj(dec_output[:, 0])
             else:
-                dec_output, caches = self.run_kernel_v1(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
+                dec_output = self.dropout(
+                    self.tgt_word_emb(ys) * self.scale +
+                    self.positional_encoding(ys))
 
-            if _t0 is not None and debug_step_timing:
-                try:
-                    if device.type == "npu" and hasattr(torch, "npu"):
-                        torch.npu.synchronize()
-                    _dt_ms = (time.time() - _t0) * 1000.0
-                    if debug_progress_every and (t == 0 or (t % int(debug_progress_every) == 0)):
-                        print(f"[decoder] t={t} kernel_ms={_dt_ms:.3f}", flush=True)
-                except Exception:  # pragma: no cover
-                    pass
+                _t0 = None
+                if debug_step_timing:
+                    try:
+                        if device.type == "npu" and hasattr(torch, "npu"):
+                            torch.npu.synchronize()
+                        _t0 = time.time()
+                    except Exception:  # pragma: no cover
+                        _t0 = None
 
-            dec_output = self.layer_norm_out(dec_output)
+                if use_version_2:
+                    dec_output, caches = self.run_kernel_v2(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
+                else:
+                    dec_output, caches = self.run_kernel_v1(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
 
-            t_logit = self.tgt_word_prj(dec_output[:, -1])
+                if _t0 is not None and debug_step_timing:
+                    try:
+                        if device.type == "npu" and hasattr(torch, "npu"):
+                            torch.npu.synchronize()
+                        _dt_ms = (time.time() - _t0) * 1000.0
+                        if debug_progress_every and (t == 0 or (t % int(debug_progress_every) == 0)):
+                            print(f"[decoder] t={t} kernel_ms={_dt_ms:.3f}", flush=True)
+                    except Exception:  # pragma: no cover
+                        pass
+
+                dec_output = self.layer_norm_out(dec_output)
+                t_logit = self.tgt_word_prj(dec_output[:, -1])
+
             t_scores = F.log_softmax(t_logit / softmax_smoothing, dim=-1)
 
             if eos_penalty != 1.0:
@@ -251,7 +376,12 @@ class TransformerDecoder(nn.Module):
             ys = torch.cat((ys, t_ys), dim=1)
 
             # Update caches
-            caches = [cache[topB_row_number_in_ys] for cache in caches]
+            if use_kv_cache:
+                # Keep cache tensor objects stable (important for graph capture); reorder in-place.
+                self_k_cache.copy_(self_k_cache.index_select(dim=1, index=topB_row_number_in_ys))
+                self_v_cache.copy_(self_v_cache.index_select(dim=1, index=topB_row_number_in_ys))
+            else:
+                caches = [cache[topB_row_number_in_ys] for cache in caches]
 
             # Update finished state
             is_finished = t_ys.eq(self.eos_id)
@@ -385,6 +515,41 @@ class DecoderLayer(nn.Module):
         cache[:, t : t + 1, :] = x
         return cache[:, : t + 1, :]
 
+    def forward_incremental(
+        self,
+        x_t: Tensor,
+        enc_output: Tensor,
+        cross_attn_mask: Tensor,
+        self_k_cache: Tensor,
+        self_v_cache: Tensor,
+        enc_k_cache: Tensor,
+        enc_v_cache: Tensor,
+        step_idx: Tensor,
+        self_attn_mask: Tensor,
+    ) -> Tensor:
+        # Self-attn (incremental): update KV cache at step_idx, attend over [0..t].
+        residual = x_t
+        x = self.self_attn_norm(x_t)
+        x = self.self_attn.forward_incremental(
+            x,
+            k_cache=self_k_cache,
+            v_cache=self_v_cache,
+            step_idx=step_idx,
+            valid_k_mask=self_attn_mask,
+        )
+        x = residual + x
+
+        # Cross-attn: encoder K/V are pre-projected and fixed across steps.
+        residual = x
+        x = self.cross_attn_norm(x)
+        x = self.cross_attn.forward_q_with_kv_cache(x, enc_k_cache, enc_v_cache, mask=cross_attn_mask)
+        x = residual + x
+
+        residual = x
+        x = self.mlp_norm(x)
+        x = residual + self.mlp(x)
+        return x
+
 
 class DecoderMultiHeadAttention(nn.Module):
     def __init__(self, d_model, n_head, dropout=0.1):
@@ -444,6 +609,50 @@ class DecoderMultiHeadAttention(nn.Module):
         output = self.fc(output)
         output = self.dropout(output)
 
+        return output
+
+    def project_kv(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        bs = x.size(0)
+        k = self.w_ks(x).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        v = self.w_vs(x).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        return k, v
+
+    def forward_q_with_kv_cache(self, q: Tensor, k_cache: Tensor, v_cache: Tensor, mask=None) -> Tensor:
+        # q: [B, Lq, H]; k_cache/v_cache: [B, n_head, Lk, d_k]
+        bs = q.size(0)
+        q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+        output = self.attention(q, k_cache, v_cache, mask=mask)
+        output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+        output = self.fc(output)
+        output = self.dropout(output)
+        return output
+
+    def forward_incremental(
+        self,
+        x_t: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        step_idx: Tensor,
+        valid_k_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # x_t: [B, 1, H]; k_cache/v_cache: [B, n_head, maxlen, d_k]; step_idx: [1]
+        bs = x_t.size(0)
+        q = self.w_qs(x_t).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        k_new = self.w_ks(x_t).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        v_new = self.w_vs(x_t).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+
+        k_cache.index_copy_(2, step_idx, k_new)
+        v_cache.index_copy_(2, step_idx, v_new)
+
+        mask = valid_k_mask
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+        output = self.attention(q, k_cache, v_cache, mask=mask)
+        output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+        output = self.fc(output)
+        output = self.dropout(output)
         return output
 
 
