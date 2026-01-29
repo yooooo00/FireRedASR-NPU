@@ -131,6 +131,18 @@ def parse_args():
     )
 
     parser.add_argument("--out_md", type=str, default="out/firered_aed_encoder_decoder_delay.md")
+
+    parser.add_argument(
+        "--decoder_debug_every",
+        type=int,
+        default=0,
+        help="Debug only: print decoder progress every N steps (0 disables).",
+    )
+    parser.add_argument(
+        "--decoder_debug_step_timing",
+        action="store_true",
+        help="Debug only: synchronize and print per-step kernel time (very slow).",
+    )
     return parser.parse_args()
 
 
@@ -362,6 +374,8 @@ def main():
                     args.length_penalty,
                     args.eos_penalty,
                     disable_early_stop=args.disable_early_stop,
+                    debug_progress_every=int(args.decoder_debug_every),
+                    debug_step_timing=bool(args.decoder_debug_step_timing),
                 )
 
         dec_ms = _bench_ms(device, dec_step, args.warmup, args.iters)
@@ -404,6 +418,19 @@ def main():
                     f"enable_output_clone={bool(args.aclgraph_enable_output_clone)}",
                     flush=True,
                 )
+                if (
+                    args.compile_mode == "reduce-overhead"
+                    and args.compile_target in ("decoder", "both")
+                    and args.dynamic
+                    and args.aclgraph_static_capture_size_limit
+                    and int(args.aclgraph_static_capture_size_limit) > 64
+                ):
+                    print(
+                        "[npu] WARNING: decoder autoregressive decode has varying sequence length; "
+                        "in reduce-overhead (ACLGraph) mode, raising static_capture_size_limit may cause "
+                        "many captures/recaptures and make runtime explode (10s -> 100s+).",
+                        flush=True,
+                    )
 
         try:
             if hasattr(model.encoder, "reset_kernel"):

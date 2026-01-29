@@ -1,3 +1,4 @@
+import time
 from typing import List, Optional, Dict
 
 import torch
@@ -154,7 +155,9 @@ class TransformerDecoder(nn.Module):
     def batch_beam_search(self, encoder_outputs, src_masks,
                    beam_size=1, nbest=1, decode_max_len=0,
                    softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0,
-                   disable_early_stop: bool = False):
+                   disable_early_stop: bool = False,
+                   debug_progress_every: int = 0,
+                   debug_step_timing: bool = False):
         B = beam_size
         N, Ti, H = encoder_outputs.size()
         device = encoder_outputs.device
@@ -186,10 +189,38 @@ class TransformerDecoder(nn.Module):
                 self.tgt_word_emb(ys) * self.scale +
                 self.positional_encoding(ys))
 
+            if debug_progress_every and (t == 0 or (t % int(debug_progress_every) == 0)):
+                try:
+                    print(
+                        f"[decoder] t={t} ys={tuple(ys.shape)} use_v2={bool(use_version_2)}",
+                        flush=True,
+                    )
+                except Exception:  # pragma: no cover
+                    pass
+
+            _t0 = None
+            if debug_step_timing:
+                try:
+                    if device.type == "npu" and hasattr(torch, "npu"):
+                        torch.npu.synchronize()
+                    _t0 = time.time()
+                except Exception:  # pragma: no cover
+                    _t0 = None
+
             if use_version_2:
                 dec_output, caches = self.run_kernel_v2(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
             else:
                 dec_output, caches = self.run_kernel_v1(dec_output, encoder_outputs, tgt_mask, src_mask, caches)
+
+            if _t0 is not None and debug_step_timing:
+                try:
+                    if device.type == "npu" and hasattr(torch, "npu"):
+                        torch.npu.synchronize()
+                    _dt_ms = (time.time() - _t0) * 1000.0
+                    if debug_progress_every and (t == 0 or (t % int(debug_progress_every) == 0)):
+                        print(f"[decoder] t={t} kernel_ms={_dt_ms:.3f}", flush=True)
+                except Exception:  # pragma: no cover
+                    pass
 
             dec_output = self.layer_norm_out(dec_output)
 
