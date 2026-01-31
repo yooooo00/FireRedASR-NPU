@@ -19,6 +19,7 @@ try:
     import torch_npu  # noqa: F401
 except ModuleNotFoundError:  # pragma: no cover
     torch_npu = None
+from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -147,6 +148,34 @@ def parse_args():
         "--decoder_use_kv_cache",
         action="store_true",
         help="Use incremental step-kernel with KV cache (route1).",
+    )
+
+    parser.add_argument("--profile", action="store_true", help="Enable torch.profiler trace (very slow).")
+    parser.add_argument(
+        "--profile_dir",
+        type=str,
+        default="out/profiler",
+        help="Output dir for tensorboard_trace_handler (relative to repo root).",
+    )
+    parser.add_argument(
+        "--profile_phase",
+        type=str,
+        default="compiled",
+        choices=["eager", "compiled", "both"],
+        help="Which phase to profile.",
+    )
+    parser.add_argument(
+        "--profile_target",
+        type=str,
+        default="decoder",
+        choices=["encoder", "decoder", "both"],
+        help="Which part to profile (encoder/decoder) for the selected case.",
+    )
+    parser.add_argument(
+        "--profile_case",
+        type=str,
+        default=None,
+        help="Only profile a single case, e.g. 8,152 (default: first case).",
     )
     return parser.parse_args()
 
@@ -320,6 +349,13 @@ def main():
     dtype = _dtype_from_arg(args.dtype)
     cases = _parse_cases(args)
 
+    profile_case = None
+    if args.profile_case is not None:
+        parts = [p.strip() for p in str(args.profile_case).split(",")]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid --profile_case: {args.profile_case!r}, expected 'B,T'")
+        profile_case = BenchCase(int(parts[0]), int(parts[1]))
+
     if device.type == "npu":
         if torch_npu is None:
             raise RuntimeError("Requested NPU device but torch_npu is not available")
@@ -348,6 +384,38 @@ def main():
         f"mode={args.compile_mode} disable_early_stop={args.disable_early_stop} "
         f"decoder_use_kv_cache={bool(args.decoder_use_kv_cache)}"
     )
+
+    profiled_once = {"eager": False, "compiled": False}
+
+    def _should_profile(case: BenchCase, phase: str) -> bool:
+        if not args.profile:
+            return False
+        if args.profile_phase != "both" and args.profile_phase != phase:
+            return False
+        if profiled_once.get(phase, False):
+            return False
+        target_case = profile_case or (cases[0] if cases else None)
+        return (target_case is not None) and (case == target_case)
+
+    def _profile_one(tag: str, fn) -> None:
+        # Keep profiler config simple; the goal is to export a trace for inspection.
+        out_dir = (REPO_ROOT / args.profile_dir / tag).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        activities = [ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+
+        with profile(
+            activities=activities,
+            schedule=schedule(wait=0, warmup=0, active=1, repeat=1),
+            on_trace_ready=tensorboard_trace_handler(str(out_dir)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            fn()
+            prof.step()
 
     def run_case(case: BenchCase, phase: str) -> Tuple[float, float]:
         print(f"[{phase}] case: B={case.batch_size} T={case.length_t} ...", flush=True)
@@ -386,6 +454,16 @@ def main():
                 )
 
         dec_ms = _bench_ms(device, dec_step, args.warmup, args.iters)
+
+        if _should_profile(case, phase):
+            tag = f"{phase}_B{case.batch_size}_T{case.length_t}_kv{int(bool(args.decoder_use_kv_cache))}"
+            print(f"[profile] collecting trace: {tag}", flush=True)
+            if args.profile_target in ("encoder", "both"):
+                _profile_one(f"{tag}_encoder", enc_step)
+            if args.profile_target in ("decoder", "both"):
+                _profile_one(f"{tag}_decoder", dec_step)
+            profiled_once[phase] = True
+
         print(f"[{phase}] done: B={case.batch_size} T={case.length_t} enc={enc_ms:.3f}ms dec={dec_ms:.3f}ms", flush=True)
         return enc_ms, dec_ms
 
